@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""
+overwatch - Terminal code review viewer for Claude Code workflows.
+Monitors git-tracked file changes and shows diffs in vim inside a tmux pane.
+Supports inline comments that can be read by Claude Code.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+
+def get_git_root(path=None):
+    """Get the git root directory."""
+    cmd = ["git", "rev-parse", "--show-toplevel"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=path, check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def get_modified_files(git_root):
+    """Get list of files modified relative to HEAD (staged + unstaged + untracked)."""
+    files = []
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            capture_output=True, text=True, cwd=git_root, check=True
+        )
+        for f in result.stdout.strip().splitlines():
+            if f and f not in files:
+                files.append(f)
+
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, cwd=git_root, check=True
+        )
+        for f in result.stdout.strip().splitlines():
+            if f and f not in files:
+                files.append(f)
+    except subprocess.CalledProcessError:
+        pass
+
+    return sorted(files)
+
+
+def ensure_overwatch_dir(git_root):
+    """Ensure .overwatch directory exists."""
+    ow_dir = os.path.join(git_root, ".overwatch")
+    os.makedirs(ow_dir, exist_ok=True)
+    return ow_dir
+
+
+def generate_vimscript(git_root, modified_files, state_file):
+    """Generate vimscript from template with placeholders replaced."""
+    if not modified_files:
+        return VIMSCRIPT_EMPTY
+
+    file_list_json = json.dumps(modified_files)
+    comments_file = os.path.join(git_root, ".overwatch", "comments.json")
+
+    script = VIMSCRIPT_MAIN
+    script = script.replace('%%OW_ROOT%%', git_root)
+    script = script.replace('%%OW_FILES%%', file_list_json)
+    script = script.replace('%%OW_STATE%%', state_file)
+    script = script.replace('%%OW_COMMENTS%%', comments_file)
+
+    return script
+
+
+def run_overwatch(repo_path=None):
+    """Main entry point."""
+    if repo_path:
+        git_root = get_git_root(repo_path)
+    else:
+        git_root = get_git_root()
+
+    if not git_root:
+        print("overwatch: not a git repository", file=sys.stderr)
+        sys.exit(1)
+
+    ensure_overwatch_dir(git_root)
+
+    state_file = os.path.join(tempfile.gettempdir(), "overwatch-{}.json".format(os.getpid()))
+    modified_files = get_modified_files(git_root)
+    vimscript = generate_vimscript(git_root, modified_files, state_file)
+
+    vim_config = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.vim', prefix='overwatch-', delete=False
+    )
+    vim_config.write(vimscript)
+    vim_config.close()
+
+    try:
+        vim_cmd = [
+            "vim",
+            "-R",
+            "-n",
+            "-u", vim_config.name,
+            "-i", "NONE",
+            "+set nocp",
+        ]
+        os.execvp("vim", vim_cmd)
+    finally:
+        try:
+            os.unlink(vim_config.name)
+        except OSError:
+            pass
+        try:
+            os.unlink(state_file)
+        except OSError:
+            pass
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="overwatch - Terminal code review viewer"
+    )
+    parser.add_argument(
+        "path", nargs="?", default=None,
+        help="Path to git repository (defaults to current directory)"
+    )
+    parser.add_argument(
+        "--tmux", action="store_true",
+        help="Open in a new tmux pane to the right (40%% width)"
+    )
+    args = parser.parse_args()
+
+    if args.tmux:
+        repo = args.path or os.getcwd()
+        cmd = "overwatch {}".format(repo)
+        subprocess.run([
+            "tmux", "split-window", "-h", "-l", "40%", cmd
+        ])
+    else:
+        run_overwatch(args.path)
+
+
+# ---------------------------------------------------------------------------
+# Vimscript templates
+# ---------------------------------------------------------------------------
+
+VIMSCRIPT_EMPTY = r"""
+set nocompatible
+syntax on
+set t_Co=256
+set background=dark
+set nonumber
+set laststatus=2
+set statusline=%#WarningMsg#\ \ overwatch\ -\ No\ modified\ files\ -\ waiting...\
+set autoread
+set updatetime=2000
+
+function! OwCheckFiles(timer)
+    let files_raw = system('git diff --name-only HEAD 2>/dev/null && git ls-files --others --exclude-standard 2>/dev/null')
+    if files_raw != ''
+        echom "Files detected, please restart overwatch"
+    endif
+    call timer_start(2000, 'OwCheckFiles')
+endfunction
+call timer_start(2000, 'OwCheckFiles')
+"""
+
+VIMSCRIPT_MAIN = r"""
+set nocompatible
+syntax on
+set t_Co=256
+set background=dark
+set noreadonly
+set autoread
+set updatetime=1000
+set laststatus=2
+set number
+set signcolumn=no
+set foldlevel=99
+set shortmess+=F
+set nowrap
+set buftype=nofile
+set filetype=diff
+
+" ============================================================================
+" State
+" ============================================================================
+let g:ow_root = '%%OW_ROOT%%'
+let g:ow_files = %%OW_FILES%%
+let g:ow_index = 0
+let g:ow_state_file = '%%OW_STATE%%'
+let g:ow_comments_file = '%%OW_COMMENTS%%'
+
+" ============================================================================
+" Statusline
+" ============================================================================
+function! OwStatusLine()
+    let total = len(g:ow_files)
+    let idx = g:ow_index + 1
+    let fname = g:ow_files[g:ow_index]
+    let comments = OwCountComments(fname)
+    let cinfo = comments > 0 ? '  [' . comments . ' comments]' : ''
+    return '  overwatch  |  ' . fname . '  [' . idx . '/' . total . ']' . cinfo
+endfunction
+
+function! OwHelpLine()
+    return ' Tab/S-Tab:nav  n/N:hunk  c:comment  C:show  Enter:pick  q:quit '
+endfunction
+
+set statusline=%#OwFile#%{OwStatusLine()}%=%#OwNav#%{OwHelpLine()}
+
+" ============================================================================
+" Diff line -> real file line mapping
+" ============================================================================
+function! OwGetRealLine(diff_line_nr)
+    let real_line = -1
+    let current_new = 0
+    let i = 1
+    while i <= a:diff_line_nr
+        let line = getline(i)
+        if line =~ '^@@'
+            let matches = matchlist(line, '+\(\d\+\)')
+            if len(matches) > 1
+                let current_new = str2nr(matches[1])
+                let i += 1
+                continue
+            endif
+        elseif line =~ '^-'
+            if i == a:diff_line_nr
+                let real_line = -1
+            endif
+            let i += 1
+            continue
+        elseif line =~ '^+' || line =~ '^ '
+            if i == a:diff_line_nr
+                let real_line = current_new
+            endif
+            let current_new += 1
+        endif
+        let i += 1
+    endwhile
+    return real_line
+endfunction
+
+function! OwGetRealLineRange(start_diff, end_diff)
+    let start_real = -1
+    let end_real = -1
+    let i = a:start_diff
+    while i <= a:end_diff
+        let rl = OwGetRealLine(i)
+        if rl > 0
+            if start_real < 0
+                let start_real = rl
+            endif
+            let end_real = rl
+        endif
+        let i += 1
+    endwhile
+    return [start_real, end_real]
+endfunction
+
+" ============================================================================
+" Comments system
+" ============================================================================
+function! OwLoadComments()
+    if filereadable(g:ow_comments_file)
+        try
+            let content = join(readfile(g:ow_comments_file), "\n")
+            return json_decode(content)
+        catch
+            return []
+        endtry
+    endif
+    return []
+endfunction
+
+function! OwSaveComments(comments)
+    let dir = fnamemodify(g:ow_comments_file, ':h')
+    if !isdirectory(dir)
+        call mkdir(dir, 'p')
+    endif
+    call writefile([json_encode(a:comments)], g:ow_comments_file)
+endfunction
+
+function! OwCountComments(fname)
+    let comments = OwLoadComments()
+    let count = 0
+    for c in comments
+        if c.file == a:fname && c.status == 'open'
+            let count += 1
+        endif
+    endfor
+    return count
+endfunction
+
+function! OwCountAllOpen()
+    let comments = OwLoadComments()
+    let count = 0
+    for c in comments
+        if c.status == 'open'
+            let count += 1
+        endif
+    endfor
+    return count
+endfunction
+
+" Add a comment (called from normal or visual mode)
+function! OwAddComment(line_start, line_end)
+    let fname = g:ow_files[g:ow_index]
+
+    " Translate diff lines to real file lines
+    let [real_start, real_end] = OwGetRealLineRange(a:line_start, a:line_end)
+    if real_start < 0
+        echohl WarningMsg | echo "Cannot comment on this line (deleted or header)" | echohl None
+        return
+    endif
+
+    " Show context: the lines being commented
+    let context_lines = []
+    let i = a:line_start
+    while i <= a:line_end
+        let l = getline(i)
+        if l =~ '^[+ ]'
+            call add(context_lines, substitute(l, '^[+ ]', '', ''))
+        endif
+        let i += 1
+    endwhile
+
+    " Build location string
+    let loc = fname . ':' . real_start
+    if real_end > real_start
+        let loc = fname . ':' . real_start . '-' . real_end
+    endif
+
+    " Select type
+    echohl OwCommentHeader
+    echo "Comment on " . loc
+    echohl None
+    echo " "
+    echo "  [f] fix        - something to fix"
+    echo "  [s] suggestion - a better approach"
+    echo "  [q] question   - need clarification"
+    echo "  [n] nitpick    - minor style issue"
+    echo " "
+    let type_key = nr2char(getchar())
+
+    let type_map = {'f': 'fix', 's': 'suggestion', 'q': 'question', 'n': 'nitpick'}
+    if !has_key(type_map, type_key)
+        redraw | echo "Cancelled."
+        return
+    endif
+    let comment_type = type_map[type_key]
+
+    " Get comment text
+    redraw
+    echohl OwCommentHeader
+    echo "[" . comment_type . "] " . loc
+    echohl None
+    echo " "
+    for cl in context_lines[:4]
+        echohl diffAdded
+        echo "  > " . cl
+        echohl None
+    endfor
+    echo " "
+    let comment_text = input("Comment: ")
+
+    if comment_text == ''
+        redraw | echo "Cancelled."
+        return
+    endif
+
+    " Build comment object
+    let comment = {
+        \ 'file': fname,
+        \ 'line_start': real_start,
+        \ 'line_end': real_end,
+        \ 'type': comment_type,
+        \ 'text': comment_text,
+        \ 'status': 'open',
+        \ 'timestamp': strftime('%Y-%m-%dT%H:%M:%S')
+    \ }
+
+    " Save
+    let comments = OwLoadComments()
+    call add(comments, comment)
+    call OwSaveComments(comments)
+
+    " Notify
+    let open_count = OwCountAllOpen()
+    silent! call system('overwatch-notify ' . shellescape(g:ow_root) . ' ' . open_count . ' &')
+
+    redraw
+    echohl OwCommentOk
+    echo "[" . comment_type . "] Comment added on " . loc . " (" . open_count . " open)"
+    echohl None
+endfunction
+
+function! OwCommentNormal()
+    call OwAddComment(line('.'), line('.'))
+endfunction
+
+function! OwCommentVisual()
+    let [lstart, lend] = [line("'<"), line("'>")]
+    call OwAddComment(lstart, lend)
+endfunction
+
+" Show all comments for current file
+function! OwShowComments()
+    let fname = g:ow_files[g:ow_index]
+    let comments = OwLoadComments()
+    let file_comments = []
+    let idx = 0
+    for c in comments
+        if c.file == fname && c.status == 'open'
+            call add(file_comments, {'idx': idx, 'comment': c})
+        endif
+        let idx += 1
+    endfor
+
+    if len(file_comments) == 0
+        echo "No comments on " . fname
+        return
+    endif
+
+    echo "Comments on " . fname . ":"
+    echo " "
+    for fc in file_comments
+        let c = fc.comment
+        let loc = c.line_start
+        if c.line_end > c.line_start
+            let loc = c.line_start . '-' . c.line_end
+        endif
+        echohl OwCommentType
+        echo "  [" . c.type . "] "
+        echohl None
+        echon "L" . loc . ": " . c.text
+    endfor
+    echo " "
+    echo "Press any key to continue..."
+    call getchar()
+    redraw
+endfunction
+
+" ============================================================================
+" Load diff
+" ============================================================================
+function! OwLoadFile(index)
+    let g:ow_index = a:index
+    let fname = g:ow_files[a:index]
+
+    let diff_cmd = 'cd ' . shellescape(g:ow_root) . ' && git diff HEAD -- ' . shellescape(fname) . ' 2>/dev/null'
+    let diff_output = system(diff_cmd)
+
+    " New untracked file
+    if diff_output == ''
+        let file_cmd = 'cd ' . shellescape(g:ow_root) . ' && cat ' . shellescape(fname) . ' 2>/dev/null'
+        let file_content = system(file_cmd)
+        let diff_output = "diff --git a/" . fname . " b/" . fname . "\n"
+        let diff_output .= "new file\n"
+        let diff_output .= "--- /dev/null\n"
+        let diff_output .= "+++ b/" . fname . "\n"
+        let diff_output .= "@@ -0,0 +1 @@\n"
+        for line in split(file_content, "\n")
+            let diff_output .= "+" . line . "\n"
+        endfor
+    endif
+
+    setlocal modifiable
+    silent! %delete _
+    silent! put =diff_output
+    silent! 1delete _
+    setlocal nomodifiable
+    setlocal filetype=diff
+
+    normal! gg
+    silent! /^@@
+    normal! zt
+
+    call OwSaveState()
+endfunction
+
+" ============================================================================
+" Navigation
+" ============================================================================
+function! OwNext()
+    let next = (g:ow_index + 1) % len(g:ow_files)
+    call OwLoadFile(next)
+endfunction
+
+function! OwPrev()
+    let prev = g:ow_index - 1
+    if prev < 0
+        let prev = len(g:ow_files) - 1
+    endif
+    call OwLoadFile(prev)
+endfunction
+
+function! OwNextHunk()
+    silent! /^@@
+endfunction
+
+function! OwPrevHunk()
+    silent! ?^@@
+endfunction
+
+function! OwPicker()
+    let choices = []
+    let idx = 0
+    for f in g:ow_files
+        let cc = OwCountComments(f)
+        let marker = (idx == g:ow_index) ? '> ' : '  '
+        let cmark = cc > 0 ? ' (' . cc . ' comments)' : ''
+        call add(choices, marker . (idx + 1) . '. ' . f . cmark)
+        let idx += 1
+    endfor
+    let choice = inputlist(['Select file:'] + choices)
+    if choice > 0 && choice <= len(g:ow_files)
+        call OwLoadFile(choice - 1)
+    endif
+endfunction
+
+" ============================================================================
+" Refresh
+" ============================================================================
+function! OwRefreshFiles(timer)
+    let cmd = 'cd ' . shellescape(g:ow_root) . ' && git diff --name-only HEAD 2>/dev/null && git ls-files --others --exclude-standard 2>/dev/null'
+    let new_files_raw = system(cmd)
+    let new_files_list = split(new_files_raw, "\n")
+    let filtered = []
+    for item in new_files_list
+        if item != ''
+            call add(filtered, item)
+        endif
+    endfor
+    let new_files = sort(filtered)
+
+    let seen = {}
+    let unique_files = []
+    for f in new_files
+        if !has_key(seen, f)
+            let seen[f] = 1
+            call add(unique_files, f)
+        endif
+    endfor
+
+    if unique_files != g:ow_files
+        let g:ow_files = unique_files
+        if len(g:ow_files) > 0
+            if g:ow_index >= len(g:ow_files)
+                let g:ow_index = 0
+            endif
+            call OwLoadFile(g:ow_index)
+        endif
+    else
+        let fname = g:ow_files[g:ow_index]
+        let diff_cmd = 'cd ' . shellescape(g:ow_root) . ' && git diff HEAD -- ' . shellescape(fname) . ' 2>/dev/null'
+        let new_diff = system(diff_cmd)
+        let cur_line = line('.')
+
+        setlocal modifiable
+        let old_content = join(getline(1, '$'), "\n")
+        if new_diff != '' && new_diff != old_content
+            silent! %delete _
+            silent! put =new_diff
+            silent! 1delete _
+            execute cur_line
+        endif
+        setlocal nomodifiable
+    endif
+
+    call timer_start(2000, 'OwRefreshFiles')
+endfunction
+
+" ============================================================================
+" State
+" ============================================================================
+function! OwSaveState()
+    let state = {'index': g:ow_index, 'file': g:ow_files[g:ow_index], 'total': len(g:ow_files)}
+    call writefile([json_encode(state)], g:ow_state_file)
+endfunction
+
+" ============================================================================
+" Keybindings
+" ============================================================================
+nnoremap <silent> <Tab> :call OwNext()<CR>
+nnoremap <silent> <S-Tab> :call OwPrev()<CR>
+nnoremap <silent> <CR> :call OwPicker()<CR>
+nnoremap <silent> q :qa!<CR>
+nnoremap <silent> r :call OwRefreshFiles(0)<CR>
+nnoremap <silent> n :call OwNextHunk()<CR>
+nnoremap <silent> N :call OwPrevHunk()<CR>
+nnoremap <silent> c :call OwCommentNormal()<CR>
+vnoremap <silent> c :<C-u>call OwCommentVisual()<CR>
+nnoremap <silent> C :call OwShowComments()<CR>
+
+" ============================================================================
+" Colors
+" ============================================================================
+highlight OwFile ctermbg=24 ctermfg=15 cterm=bold
+highlight OwNav  ctermbg=238 ctermfg=250
+highlight OwCommentHeader ctermfg=228 cterm=bold
+highlight OwCommentType ctermfg=141 cterm=bold
+highlight OwCommentOk ctermfg=114 cterm=bold
+
+highlight diffAdded    ctermfg=114 ctermbg=22
+highlight diffRemoved  ctermfg=210 ctermbg=52
+highlight diffLine     ctermfg=39  cterm=bold
+highlight diffFile     ctermfg=228 cterm=bold
+highlight diffIndexLine ctermfg=141
+
+" ============================================================================
+" Start
+" ============================================================================
+call OwLoadFile(0)
+call timer_start(2000, 'OwRefreshFiles')
+"""
+
+
+if __name__ == "__main__":
+    main()

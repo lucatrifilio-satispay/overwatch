@@ -1,0 +1,16 @@
+#!/bin/bash
+# overwatch-notify - Notifies Claude Code that there are pending review comments
+# Called by overwatch when a comment is added.
+#
+# Usage: overwatch-notify <repo_root> <open_count>
+
+REPO_ROOT="$1"
+OPEN_COUNT="$2"
+
+if [ -z "$REPO_ROOT" ] || [ -z "$OPEN_COUNT" ]; then
+    exit 1
+fi
+
+# Write a signal file that Claude Code hooks can detect
+SIGNAL_FILE="${REPO_ROOT}/.overwatch/pending-review"
+echo "${OPEN_COUNT}" > "$SIGNAL_FILE"
