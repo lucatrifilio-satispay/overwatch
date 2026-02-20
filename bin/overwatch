@@ -576,12 +576,14 @@ function! OwRefreshFiles(timer)
 
     if unique_files != g:ow_files
         let g:ow_files = unique_files
-        if len(g:ow_files) > 0
-            if g:ow_index >= len(g:ow_files)
-                let g:ow_index = 0
-            endif
-            call OwLoadFile(g:ow_index)
+        if len(g:ow_files) == 0
+            " No more modified files - exit
+            qa!
         endif
+        if g:ow_index >= len(g:ow_files)
+            let g:ow_index = 0
+        endif
+        call OwLoadFile(g:ow_index)
     else
         let fname = g:ow_files[g:ow_index]
         let diff_cmd = 'cd ' . shellescape(g:ow_root) . ' && git diff HEAD -- ' . shellescape(fname) . ' 2>/dev/null'
