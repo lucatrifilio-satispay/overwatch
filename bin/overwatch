@@ -206,7 +206,7 @@ function! OwStatusLine()
 endfunction
 
 function! OwHelpLine()
-    return ' Tab/S-Tab:nav  n/N:hunk  c:comment  C:show  Enter:pick  q:quit '
+    return ' Tab/S-Tab:nav  n/N:hunk  c:comment  C:show  R:submit  q:quit '
 endfunction
 
 set statusline=%#OwFile#%{OwStatusLine()}%=%#OwNav#%{OwHelpLine()}
@@ -286,13 +286,13 @@ endfunction
 
 function! OwCountComments(fname)
     let comments = OwLoadComments()
-    let count = 0
+    let cnt = 0
     for c in comments
         if c.file == a:fname && c.status == 'open'
-            let count += 1
+            let cnt += 1
         endif
     endfor
-    return count
+    return cnt
 endfunction
 
 function! OwCountAllOpen()
@@ -388,13 +388,10 @@ function! OwAddComment(line_start, line_end)
     call add(comments, comment)
     call OwSaveComments(comments)
 
-    " Notify
     let open_count = OwCountAllOpen()
-    silent! call system('overwatch-notify ' . shellescape(g:ow_root) . ' ' . open_count . ' &')
-
     redraw
     echohl OwCommentOk
-    echo "[" . comment_type . "] Comment added on " . loc . " (" . open_count . " open)"
+    echo "[" . comment_type . "] Comment added on " . loc . " (" . open_count . " open) - press R when done to submit review"
     echohl None
 endfunction
 
@@ -442,6 +439,37 @@ function! OwShowComments()
     echo "Press any key to continue..."
     call getchar()
     redraw
+endfunction
+
+" Submit review - signal Claude Code to resolve all open comments
+function! OwSubmitReview()
+    let open_count = OwCountAllOpen()
+    if open_count == 0
+        echohl WarningMsg | echo "No open comments to submit." | echohl None
+        return
+    endif
+
+    echohl OwCommentHeader
+    echo "Submit review with " . open_count . " comment(s)?"
+    echohl None
+    echo " "
+    echo "  [y] Yes - send to Claude Code"
+    echo "  [n] No  - keep reviewing"
+    echo " "
+    let confirm = nr2char(getchar())
+
+    if confirm != 'y'
+        redraw | echo "Review not submitted."
+        return
+    endif
+
+    " Write signal file
+    silent! call system('overwatch-notify ' . shellescape(g:ow_root) . ' ' . open_count)
+
+    redraw
+    echohl OwSubmitOk
+    echo "Review submitted! " . open_count . " comment(s) sent to Claude Code."
+    echohl None
 endfunction
 
 " ============================================================================
@@ -595,6 +623,7 @@ nnoremap <silent> N :call OwPrevHunk()<CR>
 nnoremap <silent> c :call OwCommentNormal()<CR>
 vnoremap <silent> c :<C-u>call OwCommentVisual()<CR>
 nnoremap <silent> C :call OwShowComments()<CR>
+nnoremap <silent> R :call OwSubmitReview()<CR>
 
 " ============================================================================
 " Colors
@@ -604,6 +633,7 @@ highlight OwNav  ctermbg=238 ctermfg=250
 highlight OwCommentHeader ctermfg=228 cterm=bold
 highlight OwCommentType ctermfg=141 cterm=bold
 highlight OwCommentOk ctermfg=114 cterm=bold
+highlight OwSubmitOk ctermfg=228 ctermbg=22 cterm=bold
 
 highlight diffAdded    ctermfg=114 ctermbg=22
 highlight diffRemoved  ctermfg=210 ctermbg=52

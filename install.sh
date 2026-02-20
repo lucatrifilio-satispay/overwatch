@@ -15,10 +15,12 @@ mkdir -p "$BIN_DIR"
 ln -sf "${SCRIPT_DIR}/bin/overwatch" "${BIN_DIR}/overwatch"
 ln -sf "${SCRIPT_DIR}/bin/overwatch-tmux" "${BIN_DIR}/overwatch-tmux"
 ln -sf "${SCRIPT_DIR}/bin/overwatch-notify" "${BIN_DIR}/overwatch-notify"
+ln -sf "${SCRIPT_DIR}/bin/overwatch-check" "${BIN_DIR}/overwatch-check"
 
 echo "  Linked: overwatch -> ${BIN_DIR}/overwatch"
 echo "  Linked: overwatch-tmux -> ${BIN_DIR}/overwatch-tmux"
 echo "  Linked: overwatch-notify -> ${BIN_DIR}/overwatch-notify"
+echo "  Linked: overwatch-check -> ${BIN_DIR}/overwatch-check"
 
 # Check dependencies
 if ! command -v vim &> /dev/null; then

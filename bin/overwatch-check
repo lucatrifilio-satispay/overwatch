@@ -1,0 +1,56 @@
+#!/bin/bash
+# overwatch-check - Check for pending review comments
+# Called by Claude Code Stop hook.
+# If pending comments exist, outputs instructions for Claude Code to resolve them.
+# The output becomes context for Claude's next action.
+
+# Find the git root
+GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$GIT_ROOT" ]; then
+    exit 0
+fi
+
+SIGNAL_FILE="${GIT_ROOT}/.overwatch/pending-review"
+COMMENTS_FILE="${GIT_ROOT}/.overwatch/comments.json"
+
+# Only proceed if signal file exists
+if [ ! -f "$SIGNAL_FILE" ]; then
+    exit 0
+fi
+
+# Check there are actually open comments
+if [ ! -f "$COMMENTS_FILE" ]; then
+    rm -f "$SIGNAL_FILE"
+    exit 0
+fi
+
+OPEN_COUNT=$(python3 -c "
+import json, sys
+try:
+    comments = json.load(open('${COMMENTS_FILE}'))
+    print(sum(1 for c in comments if c.get('status') == 'open'))
+except:
+    print(0)
+")
+
+if [ "$OPEN_COUNT" = "0" ]; then
+    rm -f "$SIGNAL_FILE"
+    exit 0
+fi
+
+# Remove signal file BEFORE outputting (prevents loop)
+rm -f "$SIGNAL_FILE"
+
+# Output context for Claude Code
+echo ""
+echo "=== OVERWATCH: ${OPEN_COUNT} pending review comment(s) ==="
+echo ""
+echo "Your human reviewer has left comments on your code via overwatch."
+echo "Review comments file: ${COMMENTS_FILE}"
+echo ""
+echo "Instructions:"
+echo "1. Read ${COMMENTS_FILE} to see all open comments"
+echo "2. For each comment with status 'open', apply the requested change"
+echo "3. After resolving each comment, update its status to 'resolved' in the JSON file"
+echo "4. Do NOT add new comments, only resolve existing ones"
+echo ""
